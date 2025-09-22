@@ -11,17 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ---------- FastAPI Setup ----------
-app = FastAPI(title="Scrynk.io Backend (Playwright)", version="3.1.0")
+app = FastAPI(title="Scrynk.io Backend (Playwright)", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "*"  # Narrow this in production (use your real frontend origin)
-    ],
+    allow_origins=["*"],  # ✅ keep wide-open for testing (restrict in production!)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,19 +27,14 @@ class ExtractionRequest(BaseModel):
     password: str | None = None
     post_url: str
 
-# ---------- In-memory storage for last run ----------
+# ---------- In-memory storage ----------
 collected_data: List[Dict[str, str]] = []  # [{"name": "...", "email": "..."}]
-
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 
 # ---------- Helpers: set comments sort to "Most recent" ----------
 def set_sort_to_most_recent(page) -> bool:
-    """
-    Attempts multiple strategies to set comment sort to 'Most recent'.
-    Returns True if verification indicates 'recent' present in UI text.
-    """
     try:
-        # 1) Try common dropdown/button selectors and click
+        # Try common dropdown selectors
         dropdown_selectors = [
             "button:has-text('Most relevant')",
             "button[aria-label*='Sort comments by']",
@@ -66,90 +55,43 @@ def set_sort_to_most_recent(page) -> bool:
                 dropdown.scroll_into_view_if_needed()
                 dropdown.click(timeout=3000)
             except Exception:
-                # fallback: try JS click
                 page.evaluate("(el) => el.click()", dropdown)
+            page.wait_for_timeout(400)
 
-            page.wait_for_timeout(400)  # allow hover/menu to appear
+        # Click “Most recent” if visible
+        option = None
+        for txt in ("Most recent", "Most Recent"):
+            loc = page.locator(f"text=\"{txt}\"")
+            if loc.count() > 0:
+                option = loc.first
+                break
+        if option:
+            option.scroll_into_view_if_needed()
+            try:
+                option.click(timeout=2000)
+            except Exception:
+                page.evaluate("(el) => el.click()", option)
+            page.wait_for_timeout(600)
 
-        # 2) Direct click on the 'Most recent' text
-        try:
-            # case-insensitive: try both lowercase and title-case
-            option = None
-            for txt in ("Most recent", "Most Recent", "Most recent"):
-                loc = page.locator(f"text=\"{txt}\"")
-                if loc.count() > 0:
-                    option = loc.first
-                    break
-            if option:
-                option.scroll_into_view_if_needed()
-                try:
-                    option.click(timeout=2000)
-                except Exception:
-                    page.evaluate("(el) => el.click()", option)
-                page.wait_for_timeout(600)
-        except Exception:
-            pass
-
-        # 3) Keyboard fallback (TAB until active element contains 'Most recent', press Enter)
-        try:
-            body = page.locator("body")
-            if body.count():
-                max_tabs = 12
-                found = False
-                for _ in range(max_tabs):
-                    body.press("Tab")
-                    page.wait_for_timeout(200)
-                    active_text = page.evaluate("return document.activeElement ? document.activeElement.innerText || '' : ''")
-                    if active_text and ("most recent" in active_text.lower() or "recent" == active_text.strip().lower()):
-                        page.keyboard.press("Enter")
-                        page.wait_for_timeout(500)
-                        found = True
-                        break
-                if not found:
-                    # JS fallback: find span elements and click one exactly matching 'most recent'
-                    js = """
-                    const spans = Array.from(document.querySelectorAll('span,div,a'));
-                    for (const s of spans) {
-                        if (s.innerText && s.innerText.trim().toLowerCase() === 'most recent') {
-                            s.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                    """
-                    clicked = page.evaluate(js)
-                    if clicked:
-                        page.wait_for_timeout(500)
-        except Exception:
-            pass
-
-        # 4) Verify filter contains 'recent'
-        try:
-            cand = page.locator("button[aria-label*='Sort comments by'], button:has-text('Most recent'), button:has-text('Most relevant')").first
-            if cand and cand.count():
-                txt = cand.inner_text().strip().lower()
-                if "recent" in txt:
-                    return True
-        except Exception:
-            pass
-
-        # Final heuristic: existence of a selected option text 'Most recent'
-        try:
-            if page.locator("text='Most recent'").count() > 0:
+        # Verify
+        cand = page.locator(
+            "button[aria-label*='Sort comments by'], "
+            "button:has-text('Most recent'), "
+            "button:has-text('Most relevant')"
+        ).first
+        if cand and cand.count():
+            txt = cand.inner_text().strip().lower()
+            if "recent" in txt:
                 return True
-        except Exception:
-            pass
 
-        return False
+        return page.locator("text='Most recent'").count() > 0
     except Exception as e:
         print("[set_sort_to_most_recent] exception:", e)
         return False
 
-
-# ---------- Extraction logic ----------
+# ---------- Extraction ----------
 def extract_from_page(page) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
-    # Try comment containers common to LinkedIn
     container_selectors = [
         ".comments-comment-item",
         "li.comments-comment-item",
@@ -166,36 +108,35 @@ def extract_from_page(page) -> List[Dict[str, str]]:
         except Exception:
             continue
 
-    # If none found, fallback to scanning sections of the page
-    if not containers:
-        try:
-            containers = page.locator("li, div").all()[:0]
-        except Exception:
-            containers = []
-
     for c in containers:
         try:
             name = ""
-            # attempt a few name selectors
             try:
-                name_loc = c.locator(".comments-post-meta__name-text, .feed-shared-actor__name, a[href*='/in/'], .commenter-name").first
+                name_loc = c.locator(
+                    ".comments-post-meta__name-text, "
+                    ".feed-shared-actor__name, "
+                    "a[href*='/in/'], "
+                    ".commenter-name"
+                ).first
                 if name_loc and name_loc.count():
                     name = name_loc.inner_text().strip()
             except Exception:
-                name = ""
+                pass
 
-            # comment text
             content = ""
             try:
-                content_loc = c.locator(".comments-comment-item__main-content, .comment-body, .feed-shared-update-v2__description").first
+                content_loc = c.locator(
+                    ".comments-comment-item__main-content, "
+                    ".comment-body, "
+                    ".feed-shared-update-v2__description"
+                ).first
                 if content_loc and content_loc.count():
                     content = content_loc.inner_text().strip()
             except Exception:
-                # fallback use container text
                 try:
                     content = c.inner_text().strip()
                 except Exception:
-                    content = ""
+                    pass
 
             if not content:
                 continue
@@ -208,8 +149,7 @@ def extract_from_page(page) -> List[Dict[str, str]]:
         except Exception:
             continue
 
-    # Extra fallback: search entire page for emails
-    if not results:
+    if not results:  # fallback search
         try:
             html = page.content()
             found = list(set(EMAIL_RE.findall(html)))
@@ -220,10 +160,9 @@ def extract_from_page(page) -> List[Dict[str, str]]:
 
     return results
 
-
 def run_extraction_playwright(email: str | None, password: str | None, post_url: str) -> List[Dict[str, str]]:
     global collected_data
-    collected_data = []  # reset for each run
+    collected_data = []
     results: List[Dict[str, str]] = []
 
     with sync_playwright() as p:
@@ -233,7 +172,7 @@ def run_extraction_playwright(email: str | None, password: str | None, post_url:
         page.set_default_timeout(20000)
 
         try:
-            # Optionally login
+            # Optional login
             if email and password:
                 try:
                     page.goto("https://www.linkedin.com/login", wait_until="networkidle")
@@ -243,38 +182,26 @@ def run_extraction_playwright(email: str | None, password: str | None, post_url:
                     page.wait_for_load_state("networkidle")
                     time.sleep(2)
                 except Exception:
-                    # alternative selectors
-                    try:
-                        page.fill("input[name='session_key']", email)
-                        page.fill("input[name='session_password']", password)
-                        page.keyboard.press("Enter")
-                        page.wait_for_load_state("networkidle")
-                        time.sleep(2)
-                    except Exception:
-                        pass
+                    pass
 
-            # Go to post URL
+            # Open post
             page.goto(post_url, wait_until="networkidle")
             time.sleep(1.2)
 
             ok = set_sort_to_most_recent(page)
             if not ok:
-                print("[run_extraction_playwright] could not confirm 'Most recent' — continuing anyway")
+                print("[warn] Could not confirm 'Most recent'")
 
-            # Scroll and extract multiple times
-            iterations = 6
-            for i in range(iterations):
+            # Scroll and extract
+            for _ in range(6):
                 page.evaluate("window.scrollBy(0, 700)")
                 page.wait_for_timeout(1200)
                 batch = extract_from_page(page)
-                if batch:
-                    for r in batch:
-                        if r not in collected_data:
-                            collected_data.append(r)
-                            results.append(r)
+                for r in batch:
+                    if r not in collected_data:
+                        collected_data.append(r)
+                        results.append(r)
 
-            # one final pass
-            page.wait_for_timeout(700)
             final_batch = extract_from_page(page)
             for r in final_batch:
                 if r not in collected_data:
@@ -294,7 +221,6 @@ def run_extraction_playwright(email: str | None, password: str | None, post_url:
 
     return collected_data
 
-
 # ---------- API Endpoints ----------
 @app.post("/extract/")
 def extract_emails_api(request: ExtractionRequest):
@@ -304,7 +230,6 @@ def extract_emails_api(request: ExtractionRequest):
         "results": data,
         "post_url": request.post_url,
     }
-
 
 @app.get("/download/")
 def download_emails(format: str = Query("csv", enum=["csv", "txt"])):
@@ -323,7 +248,7 @@ def download_emails(format: str = Query("csv", enum=["csv", "txt"])):
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=contacts.csv"},
         )
-    else:  # txt
+    else:
         content = "\n".join([f"{row.get('name','')} - {row.get('email','')}" for row in collected_data])
         return StreamingResponse(
             iter([content]),
