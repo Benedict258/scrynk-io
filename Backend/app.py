@@ -13,9 +13,14 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # ---------- FastAPI Setup ----------
 app = FastAPI(title="Scrynk.io Backend (Playwright)", version="3.2.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ✅ keep wide-open for testing (restrict in production!)
+    allow_origins=[
+        "https://scrnk-io-5wyj.onrender.com",  # your frontend URL
+        "http://localhost:3000"  # optional, for local dev
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
